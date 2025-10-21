@@ -1,13 +1,14 @@
 # Binaries
 win-secrets
 
-# Go build artifacts
+# Go build artifacts etc
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 repomix-output.xml
+secrets.yaml
 
 # Test binary, built with `go test -c`
 *.test
