@@ -14,7 +14,29 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"gopkg.in/yaml.v3"
 )
+
+// Populated at link time via -ldflags, with sane defaults for dev
+var (
+	Version = "dev"
+	Commit  = "none"
+	Date    = "unknown"
+)
+
+func init() {
+	// Custom help that includes a one-paragraph intro and version
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(),
+			"win-secrets mounts a read-only virtual filesystem that exposes individual values from a SOPS-encrypted YAML file as files, decrypting on-demand via a remote SOPS keyservice over gRPC. No plaintext is written to disk; each read triggers decryption of just the requested key path and returns it as file content.\n\n",
+		)
+		fmt.Fprintf(flag.CommandLine.Output(), "Version: %s (commit %s, date %s)\n\n", Version, Commit, Date)
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n")
+		flag.PrintDefaults()
+	}
+}
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -33,18 +55,18 @@ const (
 
 type SopsFS struct {
 	fuse.FileSystemBase
-	sopsClient     *SopsClient
-	secretsWSLPath string
-	secretsTree    map[string]interface{}
-	secretsCache   map[string]cachedSecret
-	mu             sync.RWMutex
+	sopsClient   *SopsClient
+	secretsPath  string
+	secretsTree  map[string]interface{}
+	secretsCache map[string]cachedSecret
+	mu           sync.RWMutex
 }
 
-func NewSopsFS(sopsClient *SopsClient, secretsWSLPath string) (*SopsFS, error) {
+func NewSopsFS(sopsClient *SopsClient, secretsPath string) (*SopsFS, error) {
 	fs := &SopsFS{
-		sopsClient:     sopsClient,
-		secretsWSLPath: secretsWSLPath,
-		secretsCache:   make(map[string]cachedSecret),
+		sopsClient:   sopsClient,
+		secretsPath:  secretsPath,
+		secretsCache: make(map[string]cachedSecret),
 	}
 
 	if err := fs.refreshSecretsStructure(); err != nil {
@@ -74,7 +96,7 @@ func (fs *SopsFS) cacheCleanupLoop() {
 }
 
 func (fs *SopsFS) refreshSecretsStructure() error {
-	structure, err := fs.sopsClient.GetSecretsStructure(fs.secretsWSLPath)
+	structure, err := fs.sopsClient.GetSecretsStructure(fs.secretsPath)
 	if err != nil {
 		return err
 	}
@@ -326,7 +348,7 @@ func (fs *SopsFS) readSecret(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	secret, err := fs.sopsClient.DecryptKey(ctx, fs.secretsWSLPath, keyPath)
+	secret, err := fs.sopsClient.DecryptKey(ctx, fs.secretsPath, keyPath)
 	if err != nil {
 		return "", err
 	}
@@ -342,17 +364,133 @@ func (fs *SopsFS) readSecret(path string) (string, error) {
 	return secret, nil
 }
 
+// findTestKeyPath finds a suitable key path for self-testing by looking for the first leaf value
+func findTestKeyPath(secretsPath string) []string {
+	data, err := os.ReadFile(secretsPath)
+	if err != nil {
+		log.Printf("[SelfTest] Cannot read secrets file for test path discovery: %v", err)
+		return nil
+	}
+
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		log.Printf("[SelfTest] Cannot parse secrets file for test path discovery: %v", err)
+		return nil
+	}
+
+	// Remove sops metadata
+	delete(root, "sops")
+
+	// Find the first leaf path
+	var path []string
+	if findLeafPath(root, &path) {
+		return path
+	}
+
+	log.Printf("[SelfTest] Could not find any leaf values in secrets structure")
+	return nil
+}
+
+// findLeafPath recursively finds the first leaf path in the structure
+func findLeafPath(node interface{}, currentPath *[]string) bool {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key, value := range v {
+			*currentPath = append(*currentPath, key)
+			if findLeafPath(value, currentPath) {
+				return true
+			}
+			*currentPath = (*currentPath)[:len(*currentPath)-1]
+		}
+		return false
+	default:
+		// Found a leaf
+		return true
+	}
+}
+
 func main() {
-	keyserviceAddr := flag.String("keyservice", "localhost:5000", "SOPS keyservice address")
-	secretsPath := flag.String("secrets", "\\\\wsl$\\nixos\\persist\\nix-config\\nx-ago-testing\\secrets\\secrets.yaml", "Path to secrets.yaml in WSL2")
+	keyserviceAddr := flag.String("keyservice", "sops-keyservice.lan:5000", "SOPS keyservice address (tcp://host:port or host:port)")
+	secretsPath := flag.String("secrets", "secrets.yaml", "Path to SOPS-encrypted YAML file")
 	mountPoint := flag.String("mount", "/run", "Mount point")
+	selfTest := flag.Bool("selftest", false, "Run a single decrypt self-test and exit")
+	ksSmoke := flag.Bool("ks-smoketest", false, "Ping keyservice via gRPC (expects error) and exit")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	// Handle --version early
+	if *showVersion {
+		fmt.Printf("win-secrets %s (commit %s, date %s)\n", Version, Commit, Date)
+		return
+	}
+
+	if *ksSmoke {
+		if err := configureSOPSKeyservice(*keyserviceAddr); err != nil {
+			log.Fatalf("Failed to configure SOPS keyservice: %v", err)
+		}
+
+		endpoint := os.Getenv("SOPS_KEYSERVICE")
+		target := strings.TrimPrefix(endpoint, "tcp://")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		cc, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		if err != nil {
+			log.Fatalf("[Smoke] Dial: %v", err)
+		}
+		defer cc.Close()
+
+		// Test gRPC connectivity by making a call to a non-existent service
+		// This will fail with "unimplemented" if the server is responding
+		err = cc.Invoke(ctx, "/test.TestService/TestMethod", nil, nil)
+		if err == nil {
+			log.Fatalf("[Smoke] unexpected success - server should not implement test service")
+		}
+
+		// Check if it's an "unimplemented" error (good) or connection error (bad)
+		if strings.Contains(err.Error(), "unimplemented") || strings.Contains(err.Error(), "Unimplemented") {
+			log.Printf("[Smoke] OK - server responded with unimplemented (gRPC server is running)")
+		} else {
+			log.Fatalf("[Smoke] FAIL - unexpected error: %v", err)
+		}
+		return
+	}
+
+	if *selfTest {
+		if err := configureSOPSKeyservice(*keyserviceAddr); err != nil {
+			log.Fatalf("Failed to configure SOPS keyservice: %v", err)
+		}
+		LogSopsRecipients(*secretsPath)
+		sc, err := NewSopsClient(*keyserviceAddr)
+		if err != nil {
+			log.Fatalf("Failed to create SOPS client: %v", err)
+		}
+		defer sc.Close()
+
+		// Try to find a test key path - for now, use a hardcoded path or find first leaf
+		testPath := findTestKeyPath(*secretsPath)
+		if testPath == nil {
+			log.Fatalf("[SelfTest] Could not find a suitable test key path")
+		}
+
+		val, err := sc.DecryptKey(context.Background(), *secretsPath, testPath)
+		if err != nil {
+			log.Fatalf("[SelfTest] FAIL: %v", err)
+		}
+		log.Printf("[SelfTest] OK: %d bytes", len(val))
+		return
+	}
 
 	// Remove the error check since we now have a default
 	log.Printf("Starting SOPS Secrets Filesystem Proxy")
 	log.Printf("Keyservice: %s", *keyserviceAddr)
 	log.Printf("Secrets file: %s", *secretsPath)
 	log.Printf("Mount point: %s", *mountPoint)
+
+	if err := configureSOPSKeyservice(*keyserviceAddr); err != nil {
+		log.Fatalf("Failed to configure SOPS keyservice: %v", err)
+	}
 
 	sopsClient, err := NewSopsClient(*keyserviceAddr)
 	if err != nil {

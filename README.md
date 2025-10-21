@@ -1,247 +1,189 @@
-# Win-Secrets: SOPS Secrets Filesystem for Windows
+# Win-Secrets: A FUSE Filesystem for SOPS on Windows
 
-Win-Secrets is a FUSE-based filesystem that provides transparent access to SOPS-encrypted secrets on Windows systems. It bridges the gap between WSL2-stored encrypted secrets and native Windows applications by mounting secrets as a virtual filesystem.
-
-## Description
-
-This project enables Windows applications to securely access encrypted secrets stored in SOPS (Secrets OPerationS) files without exposing plaintext credentials. The system works by:
-
-1. Reading the structure of encrypted secrets from a SOPS YAML file
-2. Presenting this structure as a directory hierarchy through FUSE
-3. On-demand decryption of individual secrets when accessed
-4. Caching decrypted values for performance
-
-The filesystem appears as a read-only mount point where each secret becomes a file that can be read by any Windows application, with decryption happening transparently in the background.
+Win-Secrets mounts a read-only virtual filesystem that exposes individual values from a SOPS-encrypted YAML file as files. It is designed to bridge the gap between secrets managed by SOPS and native Windows applications that expect to read credentials from files, decrypting secrets on-demand via a remote SOPS keyservice over gRPC.
 
 ## Architecture & Logic
 
+Win-Secrets provides transparent, on-demand decryption of secrets without ever writing plaintext data to disk.
+
 ### Core Components
 
-- **SopsFS**: Main FUSE filesystem implementation that handles file operations
-- **SopsClient**: Interface to SOPS decryption via Windows `sops.exe`
-- **KeyService**: gRPC service definitions for SOPS keyservice integration
-- **Cache System**: In-memory caching of decrypted secrets with TTL
+- **SopsFS (`main.go`)**: The main FUSE filesystem implementation, built using `cgofuse`. It handles filesystem operations like `Getattr`, `Readdir`, and `Read`.
+- **SopsClient (`sops_client.go`)**: A client responsible for communicating with a remote SOPS keyservice. It handles the decryption of the secrets file.
+- **KeyService (`keyservice.proto`)**: gRPC service definitions for integrating with the SOPS keyservice.
+- **In-Memory Cache**: A caching system that stores decrypted secrets for a short duration (5 minutes) to enhance performance and reduce redundant decryption calls.
 
 ### How It Works
 
-1. **Initialization**:
-   - Parses the SOPS file structure to build a virtual directory tree
-   - Establishes connection to SOPS keyservice running in WSL2
-   - Mounts the FUSE filesystem at the specified mount point
+1.  **Initialization**: Upon starting, the application connects to the specified SOPS keyservice. It then parses the structure of the SOPS-encrypted YAML file to build a virtual directory tree in memory.
+2.  **Mounting**: The virtual directory tree is mounted as a read-only filesystem on the specified mount point (e.g., a drive letter like `Z:`).
+3.  **File Access**: When a user or application attempts to read a file from the virtual filesystem:
+    - The filesystem intercepts the read request.
+    - It checks its in-memory cache for a valid (non-expired) decrypted value. If a hit occurs, it returns the cached secret.
+    - If the secret is not in the cache, the `SopsClient` sends the entire encrypted file to the SOPS keyservice for decryption.
+    - The client receives the decrypted data, extracts the specific value corresponding to the requested file path, and returns it to the user.
+    - The newly decrypted secret is stored in the cache for subsequent requests.
 
-2. **File Operations**:
-   - `Getattr`: Determines if paths represent directories or files based on SOPS structure
-   - `Readdir`: Lists secrets as files/directories in the virtual filesystem
-   - `Open/Read`: Triggers decryption of specific secrets on-demand
-
-3. **Decryption Flow**:
-
-   ```
-   Application Request → FUSE → SopsFS → SopsClient → sops.exe → KeyService → Decrypted Secret
-   ```
-
-4. **Caching**:
-   - Decrypted secrets cached for 5 minutes to reduce decryption overhead
-   - Automatic cleanup of expired cache entries every 10 minutes
-   - Thread-safe cache operations with read/write mutexes
+This entire process is transparent to the end-user or application, which simply sees a directory structure and reads files as usual.
 
 ### Security Model
 
-- Secrets are never stored in plaintext on disk
-- Decryption happens in memory only when requested
-- SOPS keyservice handles cryptographic operations
-- Filesystem is read-only to prevent accidental exposure
+- **No Plaintext on Disk**: Secrets are never stored in plaintext on the host machine's disk.
+- **In-Memory Decryption**: Decryption occurs entirely in memory and only for the requested operation.
+- **Read-Only Access**: The mounted filesystem is strictly read-only, preventing any accidental modification or exposure of the secret structure.
+- **Centralized Key Management**: All cryptographic operations are delegated to the SOPS keyservice, ensuring that private keys remain on a secure, centralized server.
 
 ## Prerequisites
 
-### Protocol Buffers
+### 1. WinFsp
 
-```bash
-# Install protoc compiler
-# Windows: Download from https://github.com/protocolbuffers/protobuf/releases
-# Linux: sudo apt install protobuf-compiler
+WinFsp is required for creating FUSE filesystems on Windows.
 
-# Install Go plugins
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
+- **Download and install from:** [https://winfsp.dev/rel/](https://winfsp.dev/rel/)
 
-### WinFsp
+### 2. Protocol Buffers (`protoc`)
 
-- Download and install from https://winfsp.dev/rel/
-- Required for Windows filesystem operations
+The `protoc` compiler is needed to generate Go code from the `.proto` definition files.
 
-### SOPS
+- **Installation:**
+  - **Windows:** Download the binary from the [Protocol Buffers GitHub releases page](https://github.com/protocolbuffers/protobuf/releases).
+  - **Linux (for cross-compilation/dev):** `sudo apt install protobuf-compiler`
+- **Go Plugins:**
+  ```bash
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+  ```
 
-- Install SOPS in WSL2: https://github.com/getsops/sops
-- Ensure `sops.exe` is available in Windows PATH
+### 3. SOPS Keyservice
+
+A running SOPS keyservice is required on your network to handle decryption requests. Refer to the [SOPS documentation](https://github.com/getsops/sops) for setup instructions.
 
 ## Setup Instructions
 
 ### 1. Build the Project
 
-```bash
-# Generate protobuf code
+Clone the repository and run the following commands to build the executable:
+
+````bash
+# 1. Generate Go code from the protobuf definition
 protoc --go_out=. --go_opt=paths=source_relative \
     --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-    keyservice.proto
+    keyservice/keyservice.proto
 
-# Download dependencies
+# 2. Download Go module dependencies
 go mod tidy
 
-# Build
-go build -o win-secrets.exe
+# 3. Build the executable
+go build -o win-secrets.exe```
 
-# Run tests
-go test -v ./...
-```
-
-### 2. Prepare Secrets File
-
-Create a SOPS-encrypted `secrets.yaml` file in WSL2 with your secrets:
-
+### 2. Prepare Your Secrets File
+Ensure you have a SOPS-encrypted YAML file. For example, `secrets.yaml`:
 ```yaml
-# secrets.yaml (encrypted with SOPS)
-database:
-  host: encrypted_host_value
-  password: encrypted_password_value
-api_keys:
-  github: encrypted_github_token
-  aws: encrypted_aws_key
-```
+# This file is encrypted with SOPS
+wifi-bruc:
+  main:
+    ssid: ENC[...]
+    pass: ENC[...]
+  guest:
+    ssid: ENC[...]
+    pass: ENC[...]
+sops:
+  # sops metadata
+  ...
+````
 
-### 3. Start SOPS Keyservice
+### 3. Start the SOPS Keyservice
 
-In WSL2 terminal:
-
-```bash
-# Start the keyservice on localhost:5000
-sops keyservice --network tcp --address 127.0.0.1:5000
-```
+On your server (e.g., in WSL2 or a Linux machine), start the SOPS keyservice:`bash
+sops keyservice --network tcp --address 0.0.0.0:5000`
 
 ### 4. Mount the Filesystem
 
-In Windows Command Prompt or PowerShell:
+From a command prompt or PowerShell on your Windows machine, run `win-secrets.exe` with the appropriate flags:
 
 ```cmd
-# Mount secrets filesystem
-win-secrets.exe -secrets "\\wsl$\Ubuntu\home\username\secrets.yaml" -mount Z:
+win-secrets.exe -secrets "C:\path\to\your\secrets.yaml" -keyservice "your-server-ip:5000" -mount "Z:"
 ```
 
-### 5. Access Secrets
+Your secrets are now accessible as a virtual drive at `Z:`.
 
-Once mounted, secrets are accessible as files:
+## Usage and Configuration
+
+### Accessing Secrets
+
+Once mounted, you can access your secrets as if they were regular files. Given the example `secrets.yaml` above, the directory structure on the `Z:` drive would be:
+
+```
+Z:
+└── wifi-bruc
+    ├── main
+    │   ├── ssid
+    │   └── pass
+    └── guest
+        ├── ssid
+        └── pass
+```
+
+You can read a secret using standard command-line tools or any application:
 
 ```cmd
-# Read database password
-type Z:\database\password
-
-# List available secrets
-dir Z:\database\
+type Z:\wifi-bruc\main\pass
 ```
 
-## Usage Examples
+### Command-Line Flags
 
-### Command Line Access
+The application can be configured with the following flags:
 
-```bash
-# Database configuration
-set DB_PASSWORD=Z:\database\password
-set DB_HOST=Z:\database\host
+| Flag            | Description                                                        | Default                    |
+| --------------- | ------------------------------------------------------------------ | -------------------------- |
+| `-keyservice`   | Address of the SOPS keyservice.                                    | `sops-keyservice.lan:5000` |
+| `-secrets`      | Path to the SOPS-encrypted YAML file.                              | `secrets.yaml`             |
+| `-mount`        | The mount point for the virtual filesystem (e.g., a drive letter). | `/run`                     |
+| `-selftest`     | Runs a single decryption test against the keyservice and exits.    | `false`                    |
+| `-ks-smoketest` | Pings the keyservice to verify gRPC connectivity and exits.        | `false`                    |
+| `-version`      | Prints the application version and exits.                          | `false`                    |
 
-# API keys
-set GITHUB_TOKEN=Z:\api_keys\github
-```
+## Troubleshooting and Diagnostics
 
-### Application Integration
+The application provides detailed logging to the console, showing filesystem operations, cache status (hit/miss), and decryption activity. For diagnosing connection issues, use the built-in test flags:
 
-```python
-# Python example
-with open('Z:\\api_keys\\github', 'r') as f:
-    token = f.read().strip()
-```
+- **Keyservice Smoke Test**: Verify that the `win-secrets` application can establish a gRPC connection to the keyservice.
 
-### Docker Integration
+  ```cmd
+  win-secrets.exe -ks-smoketest -keyservice "your-server-ip:5000"
+  ```
 
-```dockerfile
-# Dockerfile
-COPY Z:\\database\\password /app/db_password
-```
+  A successful test will log `[Smoke] OK`.
 
-## Configuration Options
-
-- `-keyservice`: SOPS keyservice address (default: localhost:5000)
-- `-secrets`: Path to encrypted secrets file in WSL2
-- `-mount`: Mount point for the virtual filesystem
-
-## Performance Considerations
-
-- First access to a secret requires decryption (may take 1-2 seconds)
-- Subsequent accesses within 5 minutes use cached values
-- Cache TTL and cleanup intervals are configurable in the source code
-- Decryption timeout is set to 10 seconds per operation
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Mount fails**: Ensure WinFsp is installed and keyservice is running
-2. **Access denied**: Check WSL2 path format (`\\wsl$\Distro\path\to\file`)
-3. **Decryption errors**: Verify SOPS configuration and key access
-4. **Slow performance**: Check keyservice connectivity and cache settings
-
-### Debug Logging
-
-The application provides detailed logging. Check the console output for:
-
-- Filesystem operations
-- Decryption attempts
-- Cache hits/misses
-- Error conditions
+- **Decryption Self-Test**: Perform a full end-to-end test by decrypting the first available secret in your `secrets.yaml` file. This confirms that the keyservice is running and has the correct keys to decrypt your file.
+  ```cmd
+  win-secrets.exe -selftest -secrets "C:\path\to\secrets.yaml" -keyservice "your-server-ip:5000"
+  ```
+  A successful test will log `[SelfTest] OK`.
 
 ## Development
 
 ### Code Structure
 
 ```
-├── main.go           # FUSE filesystem implementation
-├── sops_client.go    # SOPS decryption client
-├── main_test.go      # Unit tests
-├── keyservice/       # Protocol buffer definitions
-│   ├── keyservice.proto
-│   ├── keyservice.pb.go
-│   └── keyservice_grpc.pb.go
-└── AGENTS.md         # Build and development notes
+.
+├── main.go               # Main application and FUSE filesystem logic
+├── sops_client.go        # Client for interacting with the SOPS keyservice
+├── main_test.go          # Unit tests for path parsing
+├── keyservice/
+│   ├── keyservice.proto  # Protobuf definition for the keyservice
+│   └── ...               # Generated Go files for gRPC
+├── go.mod                # Go module definition
+└── README.md             # This file
 ```
 
 ### Testing
 
+Run the unit tests included in the project:
+
+````bash
+go test -v ./...
+```To check for race conditions during development:
 ```bash
-# Run unit tests
-go test -v
-
-# Run with race detection
-go test -race
-```
-
-### Building
-
-```bash
-# Development build
-go build -o win-secrets.exe
-
-# Optimized build
-go build -ldflags="-s -w" -o win-secrets.exe
-```
-
-## Security Notes
-
-- The mounted filesystem is read-only
-- Secrets are decrypted on-demand and cached temporarily
-- Ensure proper access controls on the mount point
-- Regularly rotate encryption keys per your security policy
-- Monitor access patterns for anomalous activity
-
-## License
-
-This project is open source. Please refer to the license file for details.
+go test -race ./...
+````
