@@ -90,6 +90,4 @@ win-secrets.exe --keyservice tcp://sops-keyservice.lan:5000 --secrets C:\secrets
 
 - The program never writes decrypted plaintext to disk and returns it only on read, while logs include key paths, endpoints, and timings but never secret values, preserving confidentiality during diagnostics and normal operation.[1]
 
-[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/39244650/9fcc6c3d-a53a-46a8-b0ef-3cd865ad895d/paste.txt)
-[2](https://www.digitalocean.com/community/tutorials/using-ldflags-to-set-version-information-for-go-applications)
-[3](https://pkg.go.dev/flag)
+  
