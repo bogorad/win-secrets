@@ -8,11 +8,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/winfsp/cgofuse/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -51,6 +53,7 @@ type cachedSecret struct {
 const (
 	secretCacheTTL     = 5 * time.Minute
 	cacheCleanupPeriod = 10 * time.Minute
+	fileWatchDebounce  = 500 * time.Millisecond
 )
 
 type SopsFS struct {
@@ -60,6 +63,8 @@ type SopsFS struct {
 	secretsTree  map[string]interface{}
 	secretsCache map[string]cachedSecret
 	mu           sync.RWMutex
+	watcher      *fsnotify.Watcher
+	stopWatch    chan struct{}
 }
 
 func NewSopsFS(sopsClient *SopsClient, secretsPath string) (*SopsFS, error) {
@@ -67,13 +72,21 @@ func NewSopsFS(sopsClient *SopsClient, secretsPath string) (*SopsFS, error) {
 		sopsClient:   sopsClient,
 		secretsPath:  secretsPath,
 		secretsCache: make(map[string]cachedSecret),
+		stopWatch:    make(chan struct{}),
 	}
 
 	if err := fs.refreshSecretsStructure(); err != nil {
 		return nil, fmt.Errorf("failed to load secrets structure: %w", err)
 	}
 
+	// Start background tasks
 	go fs.cacheCleanupLoop()
+
+	// Initialize file watcher
+	if err := fs.startFileWatcher(); err != nil {
+		log.Printf("[SopsFS] Warning: Failed to start file watcher: %v (continuing without auto-reload)", err)
+		// Non-fatal: filesystem still works, just without auto-reload
+	}
 
 	return fs, nil
 }
@@ -107,6 +120,110 @@ func (fs *SopsFS) refreshSecretsStructure() error {
 
 	log.Printf("[SopsFS] Loaded secrets structure with %d top-level keys", len(structure))
 	return nil
+}
+
+// invalidateCache clears all cached secrets
+func (fs *SopsFS) invalidateCache() {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	count := len(fs.secretsCache)
+	fs.secretsCache = make(map[string]cachedSecret)
+	log.Printf("[SopsFS] Invalidated %d cached secrets", count)
+}
+
+// startFileWatcher initializes and starts the file watcher for the secrets file
+func (fs *SopsFS) startFileWatcher() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create watcher: %w", err)
+	}
+
+	fs.watcher = watcher
+
+	// Get absolute path for watching
+	absPath, err := filepath.Abs(fs.secretsPath)
+	if err != nil {
+		fs.watcher.Close()
+		return fmt.Errorf("get absolute path: %w", err)
+	}
+
+	// Watch the directory containing the file (works better on Windows)
+	dir := filepath.Dir(absPath)
+	if err := fs.watcher.Add(dir); err != nil {
+		fs.watcher.Close()
+		return fmt.Errorf("watch directory %s: %w", dir, err)
+	}
+
+	log.Printf("[FileWatcher] Watching %s for changes", absPath)
+	go fs.fileWatchLoop(absPath)
+
+	return nil
+}
+
+// fileWatchLoop monitors the secrets file for changes and reloads when detected
+func (fs *SopsFS) fileWatchLoop(secretsPath string) {
+	var debounceTimer *time.Timer
+
+	for {
+		select {
+		case <-fs.stopWatch:
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			fs.watcher.Close()
+			log.Printf("[FileWatcher] Stopped")
+			return
+
+		case event, ok := <-fs.watcher.Events:
+			if !ok {
+				return
+			}
+
+			// Check if the event is for our secrets file
+			eventPath, _ := filepath.Abs(event.Name)
+			if eventPath != secretsPath {
+				continue
+			}
+
+			// Only react to Write and Create events (ignores Chmod, etc.)
+			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+				continue
+			}
+
+			log.Printf("[FileWatcher] Detected change: %s", event)
+
+			// Debounce: reset timer on each event
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+
+			debounceTimer = time.AfterFunc(fileWatchDebounce, func() {
+				log.Printf("[FileWatcher] Reloading secrets file...")
+
+				if err := fs.refreshSecretsStructure(); err != nil {
+					log.Printf("[FileWatcher] Error reloading secrets: %v", err)
+					return
+				}
+
+				fs.invalidateCache()
+				log.Printf("[FileWatcher] Secrets reloaded successfully")
+			})
+
+		case err, ok := <-fs.watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[FileWatcher] Error: %v", err)
+		}
+	}
+}
+
+// StopWatcher stops the file watcher (for cleanup)
+func (fs *SopsFS) StopWatcher() {
+	if fs.stopWatch != nil {
+		close(fs.stopWatch)
+	}
 }
 
 func (fs *SopsFS) navigateToPath(keyPath []string) (interface{}, bool) {
